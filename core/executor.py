@@ -32,8 +32,8 @@ except ImportError:
 
 class AngelOneExecutor:
     """
-    Manages secure authentication, FII/DII SQLite database logs,
-    and order dispatching using strict limit/stop-limit compliance rules.
+    Manages secure broker sessions, institutional database logging,
+    and payload compliance for both Angel One SmartAPI and Zerodha Kite Connect.
     """
 
     def __init__(self) -> None:
@@ -50,7 +50,7 @@ class AngelOneExecutor:
         self._enforce_ip_whitelist()
 
     def _init_database(self) -> None:
-        """Initializes SQLite database and tables for local auditing and self-correction logs."""
+        """Initializes SQLite database and tables for local auditing."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -149,11 +149,9 @@ class AngelOneExecutor:
             return True
 
         try:
-            # Initialize connection interface
             self.smart_connect = SmartConnect(api_key=settings.API_KEY)
             totp_token = self.generate_totp_token()
             
-            # Execute standard login payload
             session_data = self.smart_connect.generateSession(
                 clientCode=settings.CLIENT_ID,
                 password=settings.PASSWORD,
@@ -189,13 +187,73 @@ class AngelOneExecutor:
         except Exception as e:
             logger.error(f"Error renewing session JWT: {e}")
 
-    def execute_order(self, order_payload: Dict) -> Optional[str]:
+    def to_angel_one_payload(self, p: Dict) -> Dict:
+        """
+        Maps generic order arguments into a valid payload for Angel One SmartAPI.
+        """
+        # Determine exchange/segment product mapping (INTRADAY vs CARRYOVER / DELIVERY)
+        exchange = p.get("exchange", "NFO")
+        default_product = "CARRYOVER" if exchange == "NFO" else "DELIVERY"
+        product = p.get("product_type", default_product).upper()
+        
+        # Enforce intraday MIS product type for short positions (SELL to open)
+        if p.get("transaction_type") == "SELL" and exchange == "NSE":
+            product = "INTRADAY"
+
+        return {
+            "variety": "NORMAL",
+            "tradingsymbol": p["symbol"],
+            "symboltoken": p["token"],
+            "transactiontype": p["transaction_type"],
+            "exchange": exchange,
+            "ordertype": p.get("order_type", "LIMIT"),
+            "producttype": product,
+            "duration": "DAY",
+            "price": f"{p['limit_price']:.2f}",
+            "triggerprice": f"{p.get('trigger_price', 0.0):.2f}",
+            "quantity": str(p["quantity"])
+        }
+
+    def to_zerodha_payload(self, p: Dict) -> Dict:
+        """
+        Maps generic order arguments into a valid payload for Zerodha Kite Connect.
+        """
+        exchange = p.get("exchange", "NFO")
+        default_product = "NRML" if exchange == "NFO" else "CNC"
+        product = p.get("product_type", default_product).upper()
+        
+        # Enforce intraday MIS product type for short positions (SELL to open)
+        if p.get("transaction_type") == "SELL":
+            product = "MIS"
+
+        return {
+            "exchange": exchange,
+            "tradingsymbol": p["symbol"],
+            "transaction_type": p["transaction_type"],
+            "quantity": int(p["quantity"]),
+            "price": float(f"{p['limit_price']:.2f}"),
+            "product": product,
+            "order_type": p.get("order_type", "LIMIT"),
+            "trigger_price": float(f"{p.get('trigger_price', 0.0):.2f}"),
+            "validity": "DAY"
+        }
+
+    def execute_order(self, order_payload: Dict, broker: str = "ANGELONE") -> Optional[str]:
         """
         Sends order instructions to the exchange.
-        Enforces strict compliance: Absolute 'Market' and 'IOC' orders are prohibited.
-        Converts all orders into LIMIT or STOP-LIMIT styles.
+        Enforces strict compliance:
+        - Rounds prices precisely to the nearest tick size of ₹0.05.
+        - Absolute 'Market' and 'IOC' orders are prohibited.
+        - Converts all orders into LIMIT or STOP-LIMIT styles.
         """
-        # Validate order type compliance
+        # 1. Enforce tick size (₹0.05) rounding for all pricing fields
+        tick = 0.05
+        if "limit_price" in order_payload:
+            order_payload["limit_price"] = round(order_payload["limit_price"] / tick) * tick
+        if "trigger_price" in order_payload:
+            order_payload["trigger_price"] = round(order_payload["trigger_price"] / tick) * tick
+
+        # 2. Validate order type compliance
         ord_type = order_payload.get("order_type", "").upper()
         duration = order_payload.get("duration", "DAY").upper()
         
@@ -206,35 +264,29 @@ class AngelOneExecutor:
             )
             
         logger.info(
-            f"Dispatching compliant Order: {order_payload.get('transaction_type')} "
+            f"Dispatching compliant order for {broker}: {order_payload.get('transaction_type')} "
             f"{order_payload.get('quantity')} {order_payload.get('symbol')} "
-            f"@{order_payload.get('limit_price')} ({ord_type})"
+            f"@{order_payload.get('limit_price')}"
         )
         
+        # Generate target payload mapping
+        if broker.upper() == "ZERODHA":
+            broker_payload = self.to_zerodha_payload(order_payload)
+            logger.info(f"Mapped Zerodha payload: {broker_payload}")
+        else:
+            broker_payload = self.to_angel_one_payload(order_payload)
+            logger.info(f"Mapped Angel One payload: {broker_payload}")
+
         # If in Mock execution mode
-        if not self.smart_connect:
+        if not self.smart_connect or broker.upper() == "ZERODHA":
             mock_order_id = f"MOCK_ORD_{datetime.datetime.now().strftime('%M%S%f')}"
             logger.info(f"Simulated execution complete. Mock Order ID: {mock_order_id}")
             self._log_trade_to_audit(mock_order_id, order_payload)
             return mock_order_id
 
-        # Map to Angel One PlaceOrder payload params
+        # Angel One Live Execution
         try:
-            # Call Angel One Order Placement SDK methods
-            response = self.smart_connect.placeOrder({
-                "variety": "NORMAL",
-                "tradingsymbol": order_payload["symbol"],
-                "symboltoken": order_payload["token"],
-                "transactiontype": order_payload["transaction_type"],
-                "exchange": order_payload["exchange"],
-                "ordertype": ord_type,
-                "producttype": "CARRYOVER" if order_payload["exchange"] == "NFO" else "DELIVERY",
-                "duration": "DAY",
-                "price": str(order_payload["limit_price"]),
-                "triggerprice": str(order_payload.get("trigger_price", 0)),
-                "quantity": str(order_payload["quantity"])
-            })
-            
+            response = self.smart_connect.placeOrder(broker_payload)
             if response.get("status"):
                 order_id = response["data"]["orderid"]
                 logger.info(f"Order successfully filled on exchange. Exchange ID: {order_id}")
@@ -282,8 +334,6 @@ class AngelOneExecutor:
         Logs FII and DII net cash volumes in Crore Rupees.
         Calculates a composite sentiment multiplier used to self-correct trading sizes.
         """
-        # Composite score: positive if both are net buyers, negative if net sellers.
-        # Normed by 1000 Cr units.
         composite_score = (fii_net_cr + dii_net_cr) / 1000.0
         
         try:
@@ -306,7 +356,6 @@ class AngelOneExecutor:
     def get_historical_institutional_bias(self, lookback_days: int = 5) -> float:
         """
         Queries DB to calculate recent institutional net bias.
-        Returns a modifier multiplier (e.g. 0.8 to 1.2) to self-adjust position sizes.
         """
         try:
             conn = sqlite3.connect(self.db_path)
@@ -322,11 +371,9 @@ class AngelOneExecutor:
             conn.close()
             
             if not rows:
-                return 1.0  # Neutral modifier fallback
+                return 1.0
                 
             avg_sentiment = sum(row[0] for row in rows) / len(rows)
-            
-            # Bound modifier between 0.8 (extremely bearish flow) and 1.2 (extremely bullish flow)
             modifier = 1.0 + (avg_sentiment * 0.1)
             modifier = max(0.8, min(modifier, 1.2))
             

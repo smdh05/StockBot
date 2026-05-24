@@ -1,6 +1,10 @@
 import logging
 import math
+import os
+import json
 import sys
+import datetime
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -23,14 +27,189 @@ class Position:
     token: str
     exchange: str
     is_long: bool
-    entry_price: float
-    initial_sl: float
-    current_sl: float
+    option_entry_price: float     # Premium price of the option contract at entry
+    underlying_entry: float       # Price of the underlying index at entry
+    current_sl: float             # Stop-loss price on the underlying index
+    target_price: float           # Friction-adjusted target price on the underlying index
     initial_qty: int
     current_qty: int
-    phase: int = 1            # Phase 1, 2, or 3
+    phase: int = 1
     is_active: bool = True
     realized_pnl: float = 0.0
+
+
+def calculate_friction(price: float, qty: int, transaction_type: str, is_options: bool = True) -> float:
+    """
+    Calculates statutory transaction fees and statutory friction for Indian markets (NSE/BSE).
+    Includes: Brokerage, STT, Exchange transaction charges, GST, SEBI charges, and Stamp Duty.
+    """
+    if price <= 0 or qty <= 0:
+        return 0.0
+
+    if is_options:
+        brokerage = 20.0  # Flat ₹20 per trade (Angel One / Zerodha)
+        
+        if transaction_type.upper() == "BUY":
+            stt = 0.0
+            stamp_duty = 0.00003 * price * qty  # 0.003% on buy side premium
+        else:
+            stt = 0.00125 * price * qty  # 0.125% on sell side premium
+            stamp_duty = 0.0
+            
+        exchange_charges = 0.000495 * price * qty  # NSE Option transaction charges: 0.0495%
+        gst = 0.18 * (brokerage + exchange_charges)  # 18% GST on brokerage + exchange txn fee
+        sebi_charges = 0.000001 * price * qty  # SEBI charges: 0.0001% (Rs 10 per crore)
+        
+        total_friction = brokerage + stt + exchange_charges + gst + sebi_charges + stamp_duty
+        return total_friction
+    else:
+        brokerage = min(20.0, 0.0003 * price * qty)  # 0.03% capped at ₹20
+        
+        if transaction_type.upper() == "BUY":
+            stt = 0.0
+            stamp_duty = 0.00003 * price * qty  # 0.003% on buy side
+        else:
+            stt = 0.00025 * price * qty  # 0.025% on sell side (MIS/Intraday)
+            stamp_duty = 0.0
+            
+        exchange_charges = 0.0000325 * price * qty  # NSE Equity transaction charges: 0.00325%
+        gst = 0.18 * (brokerage + exchange_charges)
+        sebi_charges = 0.000001 * price * qty
+        
+        total_friction = brokerage + stt + exchange_charges + gst + sebi_charges + stamp_duty
+        return total_friction
+
+
+def calculate_friction_adjusted_target(entry: float, sl: float, qty: int, is_long: bool, is_options: bool = True) -> float:
+    """
+    Solves algebraically for the gross target price required to achieve a strict 1:2 Risk-to-Reward ratio
+    net of all transaction costs and statutory friction.
+    """
+    if qty <= 0:
+        return entry
+
+    # Calculate known friction amounts
+    buy_f_entry = calculate_friction(entry, qty, "BUY", is_options)
+    sell_f_sl = calculate_friction(sl, qty, "SELL", is_options)
+    sell_f_entry = calculate_friction(entry, qty, "SELL", is_options)
+    buy_f_sl = calculate_friction(sl, qty, "BUY", is_options)
+
+    if is_long:
+        net_risk = qty * (entry - sl) + buy_f_entry + sell_f_sl
+        
+        if is_options:
+            f_sell_fixed = 20.0 * 1.18
+            f_sell_var = 0.00125 + 0.000495 * 1.18 + 0.000001
+        else:
+            f_sell_fixed = 20.0 * 1.18
+            f_sell_var = 0.00025 + 0.0000325 * 1.18 + 0.000001
+
+        target = (2.0 * net_risk + qty * entry + buy_f_entry + f_sell_fixed) / (qty * (1.0 - f_sell_var))
+    else:
+        net_risk = qty * (sl - entry) + sell_f_entry + buy_f_sl
+        
+        if is_options:
+            f_buy_fixed = 20.0 * 1.18
+            f_buy_var = 0.000495 * 1.18 + 0.000001 + 0.00003
+        else:
+            f_buy_fixed = 20.0 * 1.18
+            f_buy_var = 0.0000325 * 1.18 + 0.000001 + 0.00003
+
+        target = (qty * entry - sell_f_entry - f_buy_fixed - 2.0 * net_risk) / (qty * (1.0 + f_buy_var))
+
+    # Round precisely to the nearest tick size of ₹0.05
+    tick_size = 0.05
+    target = round(target / tick_size) * tick_size
+    return max(target, tick_size)
+
+
+def validate_trade_constraints(transaction_type: str, holding_timeframe: str) -> bool:
+    """
+    Enforces intraday and short-selling guidelines.
+    """
+    tx_type = transaction_type.upper()
+    timeframe = holding_timeframe.upper()
+    
+    if tx_type == "SELL":
+        if timeframe in ("SWING", "LONG_TERM"):
+            logger.error(
+                f"COMPLIANCE VIOLATION: Short-selling (transaction_type={transaction_type}) "
+                f"is strictly blocked for holding timeframe: {holding_timeframe}."
+            )
+            return False
+            
+    return True
+
+
+class StateManager:
+    """
+    Manages persistent local state.json tracking daily loss and trade counts
+    to enforce over-trading lockouts.
+    """
+    
+    def __init__(self, state_file_path: str = "db/state.json") -> None:
+        self.state_file_path = state_file_path
+        self._lock = threading.RLock()
+        self._init_state()
+
+    def _init_state(self) -> None:
+        """Ensures state file exists and is initialized for today."""
+        dir_name = os.path.dirname(self.state_file_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        
+        with self._lock:
+            today_str = datetime.date.today().isoformat()
+            state_exists = os.path.exists(self.state_file_path)
+            
+            if not state_exists:
+                self._write_state_unsafe({
+                    "date": today_str,
+                    "daily_loss_amount": 0.0,
+                    "trade_count_today": 0,
+                    "is_locked_out": False
+                })
+            else:
+                try:
+                    state = self._read_state_unsafe()
+                    if state.get("date") != today_str:
+                        state["date"] = today_str
+                        state["daily_loss_amount"] = 0.0
+                        state["trade_count_today"] = 0
+                        state["is_locked_out"] = False
+                        self._write_state_unsafe(state)
+                except Exception as e:
+                    logger.error(f"Error reading state file, resetting: {e}")
+                    self._write_state_unsafe({
+                        "date": today_str,
+                        "daily_loss_amount": 0.0,
+                        "trade_count_today": 0,
+                        "is_locked_out": False
+                    })
+
+    def _read_state_unsafe(self) -> Dict:
+        with open(self.state_file_path, "r") as f:
+            return json.load(f)
+
+    def _write_state_unsafe(self, state: Dict) -> None:
+        with open(self.state_file_path, "w") as f:
+            json.dump(state, f, indent=4)
+
+    def get_state(self) -> Dict:
+        with self._lock:
+            self._init_state()
+            return self._read_state_unsafe()
+
+    def update_state(self, daily_loss_add: float = 0.0, trade_add: int = 0, is_locked_out: Optional[bool] = None) -> Dict:
+        with self._lock:
+            self._init_state()
+            state = self._read_state_unsafe()
+            state["daily_loss_amount"] = max(0.0, state["daily_loss_amount"] + daily_loss_add)
+            state["trade_count_today"] += trade_add
+            if is_locked_out is not None:
+                state["is_locked_out"] = is_locked_out
+            self._write_state_unsafe(state)
+            return state
 
 
 class PositionSizingEngine:
@@ -49,38 +228,23 @@ class PositionSizingEngine:
     ) -> int:
         """
         Enforces that potential loss does not exceed risk_pct of available capital.
-        
-        :param available_capital: Current available balance (equity/free cash)
-        :param entry_price: Planned entry price
-        :param stop_loss_price: Planned stop loss price
-        :param lot_size: Optional lot size for options contracts
-        :param risk_pct: Risk percentage per trade (e.g. 0.015 for 1.5%)
-        :return: Calculated safe quantity to trade (shares or contracts)
         """
         risk_per_unit = abs(entry_price - stop_loss_price)
         if risk_per_unit <= 0:
             logger.warning("Stop loss is identical to entry price. Risk per unit is zero; returning 0 quantity.")
             return 0
             
-        # Maximum capital loss allowed in currency
         max_capital_loss = available_capital * risk_pct
-        
-        # Base raw quantity based on risk parameter
         raw_qty = max_capital_loss / risk_per_unit
-        
-        # Cap raw quantity based on absolute capital limits (cannot buy more than we can afford)
         max_affordable_qty = available_capital / entry_price
         qty = min(raw_qty, max_affordable_qty)
         
-        # Adjust for options contract lot sizes if applicable
         if lot_size and lot_size > 0:
-            # Round down to nearest lot size
             qty = math.floor(qty / lot_size) * lot_size
             if qty < lot_size:
-                logger.warning(f"Calculated quantity {qty} is less than lot size {lot_size}. Minimum allocation forced to 0 to prevent risk breach.")
+                logger.warning(f"Calculated quantity {qty} is less than lot size {lot_size}. Minimum allocation forced to 0.")
                 return 0
         else:
-            # Equities / Cash sizing
             qty = math.floor(qty)
             
         logger.info(
@@ -92,7 +256,7 @@ class PositionSizingEngine:
 
 class RiskLifecycleOptimizer:
     """
-    Implements Smdh's 3-Phase Lifecycle Optimizer.
+    Implements a strict 1:2 Risk-to-Reward exit optimizer.
     Tracks state transitions of active trades and issues execution actions when target structures are reached.
     """
     
@@ -102,110 +266,27 @@ class RiskLifecycleOptimizer:
     def evaluate_position(self, position: Position, current_price: float) -> Optional[Dict]:
         """
         Evaluates current asset pricing against the position lifecycle rules.
-        Returns an execution instruction payload if a phase transition is triggered.
+        Exits the position if either the Stop Loss or the friction-adjusted Target Price is reached.
         
         :param position: The Position object to evaluate
-        :param current_price: Current market tick price for the instrument
+        :param current_price: Current market tick price for the underlying index
         :return: Optional execution order payload if action needed, else None
         """
         if not position.is_active:
             return None
-            
-        risk_per_unit = abs(position.entry_price - position.initial_sl)
-        if risk_per_unit <= 0:
-            return None
 
-        # Determine directional movement
+        # Determine directional triggers
         if position.is_long:
-            reward_per_unit = current_price - position.entry_price
             hit_stop = current_price <= position.current_sl
+            hit_target = current_price >= position.target_price if position.target_price > 0 else False
         else:
-            reward_per_unit = position.entry_price - current_price
             hit_stop = current_price >= position.current_sl
+            hit_target = current_price <= position.target_price if position.target_price > 0 else False
 
-        # Calculate current achieved Risk-to-Reward ratio
-        current_rr = reward_per_unit / risk_per_unit
-
-        # --- Phase 1 & 2 Transition Check ---
-        if position.phase == 1:
-            if current_rr >= self.settings.PHASE1_RR_THRESHOLD:
-                # Trigger Phase 1: Secure early profits by selling 50%
-                sell_qty = math.ceil(position.current_qty * self.settings.PHASE1_SELL_QUANTITY_PCT)
-                if sell_qty <= 0:
-                    sell_qty = position.current_qty
-                
-                logger.info(
-                    f"[PHASE 1 TRIGGERED] {position.symbol} achieved {current_rr:.2f} RR (Threshold: {self.settings.PHASE1_RR_THRESHOLD}). "
-                    f"Action: Selling 50% ({sell_qty} units). Transitioning to Phase 2."
-                )
-                
-                # Execute simultaneous Phase 2 update: move Stop-Loss to entry
-                old_sl = position.current_sl
-                position.current_sl = position.entry_price
-                position.current_qty -= sell_qty
-                position.phase = 3  # Instantly transition to Phase 3 (trailing/riding the rest)
-                
-                # Calculate limit price with slippage buffer
-                limit_price = self._calculate_execution_limit(
-                    current_price=current_price, 
-                    is_buy=not position.is_long  # Exiting a position is opposite transaction type
-                )
-                
-                return {
-                    "action": "PARTIAL_EXIT",
-                    "symbol": position.symbol,
-                    "token": position.token,
-                    "exchange": position.exchange,
-                    "quantity": sell_qty,
-                    "limit_price": limit_price,
-                    "updated_sl": position.current_sl,
-                    "log": f"Sold 50% at profit, SL adjusted from {old_sl} to entry price {position.entry_price}."
-                }
-                
-        # --- Phase 3 / Final Exit Check ---
-        if position.phase == 3:
-            # 1. Stop-Loss Trigger (Risk-free exit at entry price)
-            if hit_stop:
-                logger.info(
-                    f"[STOP LOSS TRIGGERED] {position.symbol} hit trailing Stop-Loss at {position.current_sl}. "
-                    f"Action: Closing remaining position of {position.current_qty} units."
-                )
-                position.is_active = False
-                limit_price = self._calculate_execution_limit(current_price=current_price, is_buy=not position.is_long)
-                
-                return {
-                    "action": "FULL_EXIT_SL",
-                    "symbol": position.symbol,
-                    "token": position.token,
-                    "exchange": position.exchange,
-                    "quantity": position.current_qty,
-                    "limit_price": limit_price,
-                    "log": f"Trailing SL hit at {position.current_sl}. Closed remaining position."
-                }
-                
-            # 2. Macro structural target reached (e.g. 1:4+ RR target)
-            if current_rr >= self.settings.PHASE3_MACRO_RR_TARGET:
-                logger.info(
-                    f"[MACRO TARGET REACHED] {position.symbol} hit macro target of {self.settings.PHASE3_MACRO_RR_TARGET} RR. "
-                    f"Action: Closing remaining position of {position.current_qty} units."
-                )
-                position.is_active = False
-                limit_price = self._calculate_execution_limit(current_price=current_price, is_buy=not position.is_long)
-                
-                return {
-                    "action": "FULL_EXIT_TARGET",
-                    "symbol": position.symbol,
-                    "token": position.token,
-                    "exchange": position.exchange,
-                    "quantity": position.current_qty,
-                    "limit_price": limit_price,
-                    "log": f"Macro profit target hit at {current_price}. Closed remaining position."
-                }
-                
-        # If stop hit in Phase 1 before achieving target
-        if position.phase == 1 and hit_stop:
+        # 1. Stop-Loss Trigger (Exit at stop-loss level)
+        if hit_stop:
             logger.info(
-                f"[INITIAL STOP TRIGGERED] {position.symbol} hit initial Stop-Loss at {position.current_sl}. "
+                f"[STOP LOSS TRIGGERED] {position.symbol} hit Stop-Loss at {position.current_sl}. "
                 f"Action: Closing full position of {position.current_qty} units."
             )
             position.is_active = False
@@ -218,16 +299,33 @@ class RiskLifecycleOptimizer:
                 "exchange": position.exchange,
                 "quantity": position.current_qty,
                 "limit_price": limit_price,
-                "log": f"Initial SL hit at {position.current_sl}. Closed position."
+                "log": f"SL hit at {position.current_sl}. Closed position."
+            }
+
+        # 2. Strict 1:2 RR Target Trigger (Exit at friction-adjusted target)
+        if hit_target:
+            logger.info(
+                f"[TARGET REACHED] {position.symbol} hit friction-adjusted 1:2 RR target at {position.target_price}. "
+                f"Action: Closing full position of {position.current_qty} units."
+            )
+            position.is_active = False
+            limit_price = self._calculate_execution_limit(current_price=current_price, is_buy=not position.is_long)
+            
+            return {
+                "action": "FULL_EXIT_TARGET",
+                "symbol": position.symbol,
+                "token": position.token,
+                "exchange": position.exchange,
+                "quantity": position.current_qty,
+                "limit_price": limit_price,
+                "log": f"Target reached at {position.target_price}. Closed position."
             }
 
         return None
 
     def _calculate_execution_limit(self, current_price: float, is_buy: bool) -> float:
         """
-        Calculates a compliant Limit price with a slippage buffer in place of forbidden Market/IOC orders.
-        For a BUY order, places limit slightly above the current price.
-        For a SELL order, places limit slightly below the current price.
+        Calculates a compliant Limit price with a slippage buffer.
         """
         buffer = self.settings.SLIPPAGE_BUFFER_TICKS * self.settings.TICK_SIZE
         if is_buy:
@@ -235,7 +333,6 @@ class RiskLifecycleOptimizer:
         else:
             limit = current_price - buffer
             
-        # Round to nearest valid tick size
         limit = round(limit / self.settings.TICK_SIZE) * self.settings.TICK_SIZE
         return max(limit, self.settings.TICK_SIZE)
 
@@ -243,21 +340,20 @@ class RiskLifecycleOptimizer:
 class DailyCircuitBreakerManager:
     """
     Monitors overall account equity parameters and triggers an immediate system disconnect
-    if cumulative losses reach defined thresholds (25% of total capital).
+    if cumulative losses reach defined thresholds (25% of total capital) or daily trade limit is reached.
     """
     
-    def __init__(self, initial_capital: float = settings.INITIAL_CAPITAL) -> None:
+    def __init__(self, initial_capital: float = settings.INITIAL_CAPITAL, state_manager: Optional[StateManager] = None) -> None:
         self.initial_capital = initial_capital
         self.max_loss_allowed = initial_capital * settings.MAX_DAILY_LOSS_LIMIT_PCT
+        self.state_manager = state_manager
         logger.info(
             f"Daily Circuit Breaker initialized: Initial Capital=INR {initial_capital:,.2f}, "
             f"Max Loss Allowed=INR {self.max_loss_allowed:,.2f} ({settings.MAX_DAILY_LOSS_LIMIT_PCT:.1%})"
         )
 
     def calculate_total_pnl(self, realized_pnl: float, active_positions: List[Position], current_prices: Dict[str, float]) -> float:
-        """
-        Calculates total (realized + floating) PnL.
-        """
+        """Calculates total (realized + floating) PnL using option premiums."""
         total_pnl = realized_pnl
         
         for pos in active_positions:
@@ -267,23 +363,46 @@ class DailyCircuitBreakerManager:
                 
             cur_price = current_prices.get(pos.token)
             if cur_price is None:
-                logger.warning(f"Live price missing for token {pos.token} / {pos.symbol}. Using entry price as fallback.")
-                cur_price = pos.entry_price
+                # Use option premium entry price as fallback
+                cur_price = pos.option_entry_price
                 
-            # Floating PnL calculation
             if pos.is_long:
-                floating_pnl = (cur_price - pos.entry_price) * pos.current_qty
+                floating_pnl = (cur_price - pos.option_entry_price) * pos.current_qty
             else:
-                floating_pnl = (pos.entry_price - cur_price) * pos.current_qty
+                floating_pnl = (pos.option_entry_price - cur_price) * pos.current_qty
                 
             total_pnl += floating_pnl + pos.realized_pnl
             
         return total_pnl
 
-    def monitor_pnl(self, realized_pnl: float, active_positions: List[Position], current_prices: Dict[str, float], executor_client=None) -> None:
+    def monitor_pnl(
+        self, 
+        realized_pnl: float, 
+        active_positions: List[Position], 
+        current_prices: Dict[str, float], 
+        executor_client=None,
+        ws_client=None
+    ) -> None:
         """
-        Actively checks current PnL. If circuit breaker condition met, executing disconnect.
+        Actively checks current PnL and trade counts. If limits are breached,
+        disconnects the WebSocket, exits positions, and locks out.
         """
+        if self.state_manager:
+            state = self.state_manager.get_state()
+            if state.get("is_locked_out"):
+                return
+                
+            # Check Trade count breach
+            max_trades = getattr(settings, "MAX_DAILY_TRADE_LIMIT", 5)
+            if state.get("trade_count_today", 0) >= max_trades:
+                logger.critical(
+                    f"!!! TRADE LIMIT BREACH !!! Today's trade count {state['trade_count_today']} "
+                    f"has reached the daily limit of {max_trades}. Locking out further executions."
+                )
+                self.state_manager.update_state(is_locked_out=True)
+                self._trigger_emergency_shutdown(active_positions, current_prices, executor_client, ws_client)
+                return
+
         total_pnl = self.calculate_total_pnl(realized_pnl, active_positions, current_prices)
         
         # If total PnL is negative and magnitude exceeds the circuit breaker limit
@@ -293,24 +412,32 @@ class DailyCircuitBreakerManager:
                 f"Total Daily Loss: INR {abs(total_pnl):,.2f} exceeds Max Limit: INR {self.max_loss_allowed:,.2f}. "
                 f"Initiating emergency system shutdown."
             )
-            self._trigger_emergency_shutdown(active_positions, current_prices, executor_client)
-            
-    def _trigger_emergency_shutdown(self, active_positions: List[Position], current_prices: Dict[str, float], executor_client) -> None:
+            if self.state_manager:
+                self.state_manager.update_state(daily_loss_add=abs(total_pnl), is_locked_out=True)
+            self._trigger_emergency_shutdown(active_positions, current_prices, executor_client, ws_client)
+
+    def _trigger_emergency_shutdown(
+        self, 
+        active_positions: List[Position], 
+        current_prices: Dict[str, float], 
+        executor_client,
+        ws_client
+    ) -> None:
         """
         Emergency closeout routines.
         Sends immediate limit exit orders with slippage buffers to liquidate all holdings.
         """
         logger.critical("EMERGENCY SHUTDOWN: Closing all open positions...")
         
-        # Exit order helper
         optimizer = RiskLifecycleOptimizer()
         
         for pos in active_positions:
             if pos.is_active:
+                # To exit option contracts, we use option premium prices
                 cur_price = current_prices.get(pos.token)
                 if not cur_price:
                     logger.warning(f"No current price available for {pos.symbol} during emergency close. Using entry.")
-                    cur_price = pos.entry_price
+                    cur_price = pos.option_entry_price
                     
                 limit_price = optimizer._calculate_execution_limit(current_price=cur_price, is_buy=not pos.is_long)
                 
@@ -321,6 +448,9 @@ class DailyCircuitBreakerManager:
                     "exchange": pos.exchange,
                     "quantity": pos.current_qty,
                     "limit_price": limit_price,
+                    "order_type": "LIMIT",
+                    "transaction_type": "SELL" if pos.is_long else "BUY",
+                    "product_type": "INTRADAY" if pos.exchange == "NSE" else "CARRYOVER"
                 }
                 
                 logger.critical(f"Dispatching exit order: {exit_payload}")
@@ -331,8 +461,15 @@ class DailyCircuitBreakerManager:
                     except Exception as e:
                         logger.critical(f"Failed to execute emergency exit for {pos.symbol}: {e}")
                 else:
-                    logger.warning("No executor client interface supplied to shutdown routine. Logged exit intent only.")
+                    logger.warning("No executor client interface supplied. Logged exit intent only.")
                     pos.is_active = False
-                    
+
+        if ws_client:
+            try:
+                logger.critical("Disconnecting WebSocket client connection...")
+                ws_client.disconnect()
+            except Exception as e:
+                logger.critical(f"Failed to disconnect WebSocket client during shutdown: {e}")
+                
         logger.critical("All active system processes terminated. Prevented revenge trading loops. Exiting environment.")
         sys.exit("SYSTEM SHUTDOWN: Daily Circuit Breaker loss limit breached.")

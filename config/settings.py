@@ -23,6 +23,11 @@ ENFORCE_IP_WHITELIST: bool = False  # Set to True in production to block non-whi
 INITIAL_CAPITAL: float = 1000000.0  # ₹10,000,000 (10 Lakhs INR)
 MAX_DAILY_LOSS_LIMIT_PCT: float = 0.25  # 25% daily circuit breaker
 MAX_RISK_PER_TRADE_PCT: float = 0.015  # 1.5% capital risked per trade
+HOLDING_TIMEFRAME: str = "INTRADAY"  # Options: INTRADAY, SWING, LONG_TERM
+MAX_DAILY_TRADE_LIMIT: int = 5  # Lockout after 5 executed trades today
+STATE_FILE_PATH = BASE_DIR / "db" / "state.json"
+MAX_VIX_THRESHOLD: float = 22.0  # Max VIX allowed for trade days
+MIN_FUNDAMENTAL_SCORE: float = 60.0  # Min fundamental results score required
 
 # Smdh's 3-Phase Lifecycle Optimizer Constants
 PHASE1_RR_THRESHOLD: float = 1.5  # Risk-to-Reward ratio to secure 50% profits

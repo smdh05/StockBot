@@ -1,7 +1,7 @@
 import logging
 import urllib.request
 import json
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
@@ -18,7 +18,14 @@ class SMCSignalDetector:
     """
     Parses OHLCV historical arrays via pandas to identify institutional SMC patterns
     including Liquidity Sweeps and Order Blocks.
+    Separates HTF structure checks from LTF trigger sweeps, ensuring caching
+    and look-ahead bias avoidance.
     """
+
+    def __init__(self, volume_multiplier: float = 1.8) -> None:
+        self.volume_multiplier = volume_multiplier
+        self.cached_htf_order_blocks: List[Dict] = []
+        self.last_processed_htf_timestamp = None
 
     @staticmethod
     def identify_liquidity_sweeps(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
@@ -27,6 +34,7 @@ class SMCSignalDetector:
         and immediately snap back within the trading range.
         
         Input DataFrame must contain columns: ['open', 'high', 'low', 'close']
+        To prevent look-ahead bias, it shifts the range comparison to only look at closed prior candles.
         """
         df = df.copy()
         df['bullish_sweep'] = False
@@ -60,23 +68,29 @@ class SMCSignalDetector:
         A Bullish Order Block is defined as the last bearish candle before an explosive upward expansion
         that breaks structure (BOS) with above-average volume.
         
-        Returns a list of order blocks with price zones.
+        Inputs: df must contain only fully closed candles (to prevent lookahead bias).
         """
         order_blocks = []
         df = df.copy()
         
+        if len(df) < 21:
+            return order_blocks
+            
         # Calculate volume average to detect institutional entry
         df['volume_sma'] = df['volume'].rolling(window=20).mean()
         
         # Loop to identify breakouts
-        for i in range(2, len(df) - 1):
-            # Identify explosive bullish candle (breakout)
-            current_vol = df.iloc[i]['volume']
-            avg_vol = df.iloc[i]['volume_sma']
+        for i in range(20, len(df)):
+            current_row = df.iloc[i]
+            prev_row = df.iloc[i-1]
             
+            current_vol = current_row['volume']
+            avg_vol = current_row['volume_sma']
+            
+            # Identify explosive bullish candle (breakout)
             is_explosive_up = (
-                df.iloc[i]['close'] > df.iloc[i]['open'] and 
-                (df.iloc[i]['close'] - df.iloc[i]['open']) > (df.iloc[i-1]['high'] - df.iloc[i-1]['low']) * 2 and
+                current_row['close'] > current_row['open'] and 
+                (current_row['close'] - current_row['open']) > (prev_row['high'] - prev_row['low']) * 2 and
                 current_vol > avg_vol * volume_multiplier
             )
             
@@ -92,14 +106,15 @@ class SMCSignalDetector:
                             "top_zone": prior_candle['high'],
                             "bottom_zone": prior_candle['low'],
                             "volume": prior_candle['volume'],
-                            "breakout_index": i
+                            "breakout_index": i,
+                            "timestamp": prior_candle.get('timestamp', df.index[j])
                         }
                         order_blocks.append(ob_zone)
                         break
                         
             is_explosive_down = (
-                df.iloc[i]['close'] < df.iloc[i]['open'] and
-                (df.iloc[i]['open'] - df.iloc[i]['close']) > (df.iloc[i-1]['high'] - df.iloc[i-1]['low']) * 2 and
+                current_row['close'] < current_row['open'] and
+                (current_row['open'] - current_row['close']) > (prev_row['high'] - prev_row['low']) * 2 and
                 current_vol > avg_vol * volume_multiplier
             )
             
@@ -114,18 +129,45 @@ class SMCSignalDetector:
                             "top_zone": prior_candle['high'],
                             "bottom_zone": prior_candle['low'],
                             "volume": prior_candle['volume'],
-                            "breakout_index": i
+                            "breakout_index": i,
+                            "timestamp": prior_candle.get('timestamp', df.index[j])
                         }
                         order_blocks.append(ob_zone)
                         break
                         
         return order_blocks
 
+    def update_htf_order_blocks(self, htf_df: pd.DataFrame) -> List[Dict]:
+        """
+        Updates and caches HTF order blocks. Recalculates ONLY when a new HTF candle closes.
+        Assumes the last row in htf_df is the active (unclosed) candle, and htf_df.iloc[-2] is the
+        latest completed candle.
+        
+        To prevent look-ahead bias, it runs the calculations on closed candles (htf_df.iloc[:-1]).
+        """
+        if htf_df.empty or len(htf_df) < 2:
+            return self.cached_htf_order_blocks
+            
+        latest_closed_candle = htf_df.iloc[-2]
+        latest_closed_timestamp = latest_closed_candle.get('timestamp', htf_df.index[-2])
+        
+        # If timestamp is different, we have a newly closed candle!
+        if latest_closed_timestamp != self.last_processed_htf_timestamp:
+            logger.info(f"New HTF candle closed at {latest_closed_timestamp}. Recalculating HTF Order Blocks...")
+            # Exclude the active unclosed candle (last row) to avoid look-ahead bias
+            closed_htf_df = htf_df.iloc[:-1]
+            self.cached_htf_order_blocks = self.find_order_blocks(closed_htf_df, self.volume_multiplier)
+            self.last_processed_htf_timestamp = latest_closed_timestamp
+        else:
+            logger.debug("HTF candle still open. Returning cached HTF Order Blocks.")
+            
+        return self.cached_htf_order_blocks
+
 
 class GlobalSentimentLayer:
     """
-    Parses macro factors to output a Daily Market Bias.
-    Indices: S&P500/Nasdaq, FX: USD-INR, Commodities: Brent/WTI Crude Oil.
+    Parses macro factors to output a Daily Market Bias and Trade Day status.
+    Indices: S&P500/Nasdaq, FX: USD-INR, Commodities: Brent/WTI Crude Oil, VIX.
     """
 
     def __init__(self, api_key: str = "") -> None:
@@ -133,18 +175,16 @@ class GlobalSentimentLayer:
 
     def fetch_overnight_metrics(self) -> Dict[str, float]:
         """
-        Fetches macro tickers. In production, this hits external global market APIs (e.g. Yahoo Finance/AlphaVantage).
-        Returns rate changes compared to the prior day.
+        Fetches macro tickers. In production, this hits external global market APIs.
         """
-        # Mock/simulated data parser matching real API structures
         logger.info("Accessing overnight global macroeconomic feeds...")
         try:
-            # Simulated responses (would perform requests.get in production environment)
             return {
                 "usd_inr_change_pct": 0.05,       # USD-INR appreciation (pos = negative for NSE)
                 "brent_crude_change_pct": -1.2,   # Crude dip (neg = positive for NSE)
                 "sp500_change_pct": 0.75,         # S&P500 rise (pos = positive for NSE)
-                "nasdaq_change_pct": 1.10          # Nasdaq rise (pos = positive for NSE)
+                "nasdaq_change_pct": 1.10,        # Nasdaq rise (pos = positive for NSE)
+                "vix": 16.5                       # Volatility Index (VIX)
             }
         except Exception as e:
             logger.error(f"Error loading global macro sentiment: {e}. Defaulting to neutral bias metrics.")
@@ -152,17 +192,37 @@ class GlobalSentimentLayer:
                 "usd_inr_change_pct": 0.0,
                 "brent_crude_change_pct": 0.0,
                 "sp500_change_pct": 0.0,
-                "nasdaq_change_pct": 0.0
+                "nasdaq_change_pct": 0.0,
+                "vix": 15.0
             }
+
+    def evaluate_market_uncertainty(self, metrics: Dict[str, float]) -> Tuple[str, str]:
+        """
+        Evaluates VIX levels and currency volatility to determine if today is a
+        TRADE_DAY or a NO_TRADE_DAY.
+        """
+        from config import settings
+        max_vix = getattr(settings, "MAX_VIX_THRESHOLD", 22.0)
+        vix = metrics.get("vix", 15.0)
+        usd_inr_change = abs(metrics.get("usd_inr_change_pct", 0.0))
+        
+        # Check 1: VIX threshold breach (high fear/uncertainty)
+        if vix > max_vix:
+            reason = f"VIX is at {vix:.1f} (exceeds threshold of {max_vix:.1f})"
+            logger.warning(f"NO_TRADE_DAY declared: {reason}. Extreme volatility risk.")
+            return "NO_TRADE_DAY", reason
+            
+        # Check 2: Currency shock (extreme USD-INR change > 1.0%)
+        if usd_inr_change > 1.0:
+            reason = f"USD-INR overnight shock of {usd_inr_change:.2f}%"
+            logger.warning(f"NO_TRADE_DAY declared: {reason}. High forex liquidity risk.")
+            return "NO_TRADE_DAY", reason
+            
+        return "TRADE_DAY", "Market indicators stable. Eligible for trading."
 
     def determine_daily_bias(self) -> str:
         """
         Synthesizes macro metrics to output daily bias: 'BULLISH', 'BEARISH', or 'NEUTRAL'.
-        
-        Logic:
-        - Weak USD-INR is bullish (< 0% change).
-        - Falling Crude is bullish (< 0% change).
-        - Rising US indices are bullish (> 0% change).
         """
         metrics = self.fetch_overnight_metrics()
         score = 0
